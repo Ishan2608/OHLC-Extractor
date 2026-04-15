@@ -11,6 +11,8 @@ Flow:
 - It creates reports in .csv and .xlsx formats.
 - It also generates a summary report in text file and markdown file.
 
+![Output Screenshot](outputs/capture1.PNG)
+
 Run Program
 
 ```python
