@@ -36,14 +36,14 @@ echo  Setup complete!
 echo.
 echo  To run the extractor:
 echo    Double-click run.bat
-echo    OR: call venv\Scripts\activate ^& python OHLC_Extractor.py
+echo    OR: call venv\Scripts\activate ^& python main.py
 echo ============================================================
 echo.
 
 if not exist "run.bat" (
     echo @echo off > run.bat
     echo call venv\Scripts\activate.bat >> run.bat
-    echo python OHLC_Extractor.py >> run.bat
+    echo python main.py >> run.bat
     echo Created run.bat
 )
 

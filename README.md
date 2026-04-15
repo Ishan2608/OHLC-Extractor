@@ -1,4 +1,4 @@
-# Stock-OHLC-Retporter (in Progress)
+# OHLC Extractor.
 
 We will use older code as base to build a new version of the Stock-OHLC-Reporter, which will be more optimized for flexibility in user requirments.
 
@@ -10,3 +10,13 @@ Flow:
 - Date range, e.g., 2018-01-01 to 2023-01-01, the specific date range for each year.
 - It creates reports in .csv and .xlsx formats.
 - It also generates a summary report in text file and markdown file.
+
+Run Program
+
+```python
+venv\Scripts\activate
+```
+
+```python
+python main.py
+```

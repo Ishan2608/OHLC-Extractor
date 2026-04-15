@@ -2,9 +2,9 @@
 OHLC Extractor — UI
 ====================
 Fetches historical OHLC data for Indian stocks using yfinance.
-Stocks are loaded from a CSV with columns:
-    ISIN, Company_Name, BSE_Symbol, NSE_Symbol,
-    Security_Code, Face_Value, ON_BSE, ON_NSE
+Stocks are auto-loaded from:  data/INDIA_LIST.csv
+Expected columns: ISIN, Company_Name, BSE_Symbol, NSE_Symbol,
+                  Security_Code, Face_Value, ON_BSE, ON_NSE
 
 Requirements:
     pip install yfinance pandas
@@ -20,7 +20,7 @@ import time
 from datetime import datetime, date
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext
 
 import pandas as pd
 import yfinance as yf
@@ -103,6 +103,40 @@ def load_stocks_from_csv(path):
                         "company": str(row.get("Company_Name", ticker)).strip(),
                         "ticker":  ticker,
                         "exchange": exchange,
+                    })
+    except Exception as e:
+        raise RuntimeError(f"Could not read CSV: {e}")
+    return stocks
+
+
+INDIA_LIST_PATH = os.path.join("data", "INDIA_LIST.csv")
+
+
+def load_stocks_both_tickers(path):
+    """
+    Load all stocks, keeping BOTH NSE and BSE tickers separately per row,
+    so Max History can try one then fall back to the other.
+    Returns list of dicts: {company, nse_ticker, bse_ticker}
+    """
+    stocks = []
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                company  = str(row.get("Company_Name", "")).strip()
+                nse_sym  = str(row.get("NSE_Symbol",   "")).strip()
+                bse_sym  = str(row.get("BSE_Symbol",   "")).strip()
+                on_nse   = str(row.get("ON_NSE", "")).strip().upper() in ("1","Y","YES","TRUE","X")
+                on_bse   = str(row.get("ON_BSE", "")).strip().upper() in ("1","Y","YES","TRUE","X")
+
+                nse_t = f"{nse_sym}.NS" if (on_nse and nse_sym) else None
+                bse_t = f"{bse_sym}.BO" if (on_bse and bse_sym) else None
+
+                if nse_t or bse_t:
+                    stocks.append({
+                        "company":    company,
+                        "nse_ticker": nse_t,
+                        "bse_ticker": bse_t,
                     })
     except Exception as e:
         raise RuntimeError(f"Could not read CSV: {e}")
@@ -354,18 +388,20 @@ class App(tk.Tk):
         self._q          = queue.Queue()
         self._stats      = {"done": 0, "total": 0, "records": 0}
         self._start_time = None
-        self._stocks     = []          # loaded from CSV
+        self._stocks     = []          # auto-loaded from INDIA_LIST.csv
+        self._selected_companies = []  # list of stock dicts chosen by user
+        self._ac_matches         = []  # current autocomplete match list
 
         # ---- Variables ----
-        self.v_stocks_path  = tk.StringVar(value="")
-        self.v_stocks_count = tk.StringVar(value="No file loaded")
-
         self.v_mode      = tk.StringVar(value=FETCH_MODES[0])
         self.v_start     = tk.StringVar(value=date.today().replace(year=date.today().year - 1).strftime("%Y-%m-%d"))
         self.v_end       = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
         self.v_past_yrs  = tk.IntVar(value=5)
         self.v_period    = tk.StringVar(value="5y")
         self.v_interval  = tk.StringVar(value="1d")
+
+        self.v_all_companies  = tk.BooleanVar(value=True)
+        self.v_company_search = tk.StringVar()
 
         self.v_do_analysis = tk.BooleanVar(value=False)
         self.v_iv_start    = tk.StringVar(value="10-01")
@@ -395,6 +431,7 @@ class App(tk.Tk):
         self._build()
         self._poll()
         self._on_mode_change()    # set initial widget visibility
+        self._auto_load_stocks()  # load INDIA_LIST.csv on startup
 
         self.update_idletasks()
         w, h = 980, 720
@@ -479,38 +516,159 @@ class App(tk.Tk):
 
         r = 0
 
-        # ── Stock CSV ──────────────────────────────────────────
-        _lbl(left, "STOCKS CSV", r); r += 1
-
-        file_row = tk.Frame(left, bg=C["panel"])
-        file_row.grid(row=r, column=0, columnspan=2,
-                      padx=20, pady=(2, 0), sticky="ew"); r += 1
-        file_row.columnconfigure(0, weight=1)
-
-        tk.Entry(
-            file_row, textvariable=self.v_stocks_path,
-            font=F_BODY, bg=C["surface"], fg=C["text"],
-            insertbackground=C["text"],
-            relief="flat", bd=0,
-            highlightthickness=1,
-            highlightbackground=C["border"],
-            highlightcolor=C["accent"],
-            state="readonly",
-        ).grid(row=0, column=0, sticky="ew", ipady=6)
-
-        _ghost_btn(file_row, "Browse", self._browse_csv).grid(
-            row=0, column=1, padx=(6, 0))
+        # ── Stock info banner ──────────────────────────────────
+        _lbl(left, "STOCKS", r); r += 1
 
         self._stocks_lbl = tk.Label(
-            left, textvariable=self.v_stocks_count,
+            left, text="Loading...",
             font=("Calibri", 8), fg=C["gold"], bg=C["panel"],
         )
         self._stocks_lbl.grid(row=r, column=0, columnspan=2,
                                padx=20, pady=(2, 0), sticky="w"); r += 1
 
-        _hint(left, "CSV must have: Company_Name, NSE_Symbol / BSE_Symbol, ON_NSE / ON_BSE", r); r += 1
+        _hint(left, f"Source: {INDIA_LIST_PATH}", r); r += 1
 
-        _gap(left, r, 12); r += 1
+        _gap(left, r, 8); r += 1
+
+        # ── Company selection ──────────────────────────────────
+        _lbl(left, "COMPANY SELECTION", r); r += 1
+
+        # "All companies" checkbox
+        self._all_chk = tk.Checkbutton(
+            left,
+            text="Fetch for ALL companies",
+            variable=self.v_all_companies,
+            font=F_SM, fg=C["dim"], bg=C["panel"],
+            selectcolor=C["surface"],
+            activebackground=C["panel"],
+            activeforeground=C["text"],
+            relief="flat",
+            command=self._on_all_companies_toggle,
+        )
+        self._all_chk.grid(row=r, column=0, columnspan=2,
+                           padx=20, sticky="w"); r += 1
+
+        # Container for the search + tags widget (hidden when All is checked)
+        self._company_sel_frame = tk.Frame(left, bg=C["panel"])
+        self._company_sel_frame.grid(row=r, column=0, columnspan=2,
+                                     sticky="ew"); r += 1
+        self._company_sel_frame.columnconfigure(0, weight=1)
+
+        # Search entry
+        search_wrap = tk.Frame(
+            self._company_sel_frame, bg=C["surface"],
+            highlightthickness=1,
+            highlightbackground=C["border"],
+            highlightcolor=C["accent"],
+        )
+        search_wrap.grid(row=0, column=0, padx=20, pady=(4, 0), sticky="ew")
+        search_wrap.columnconfigure(0, weight=1)
+
+        self._company_search_entry = tk.Entry(
+            search_wrap,
+            textvariable=self.v_company_search,
+            font=F_BODY,
+            bg=C["surface"], fg=C["text"],
+            insertbackground=C["text"],
+            relief="flat", bd=0,
+        )
+        self._company_search_entry.grid(row=0, column=0, sticky="ew",
+                                         padx=8, ipady=7)
+
+        tk.Label(search_wrap, text="⌕", font=("Calibri", 11),
+                 fg=C["dim"], bg=C["surface"]).grid(row=0, column=1, padx=(0, 8))
+
+        # Autocomplete dropdown (Toplevel-less — a Frame shown/hidden)
+        self._ac_frame = tk.Frame(
+            self._company_sel_frame,
+            bg=C["surface"],
+            highlightthickness=1,
+            highlightbackground=C["border"],
+        )
+        self._ac_frame.grid(row=1, column=0, padx=20, sticky="ew")
+        self._ac_frame.columnconfigure(0, weight=1)
+        self._ac_frame.grid_remove()   # hidden until user types
+
+        self._ac_listbox = tk.Listbox(
+            self._ac_frame,
+            font=F_BODY,
+            bg=C["surface"], fg=C["text"],
+            selectbackground=C["accent"],
+            selectforeground=C["bg"],
+            relief="flat", bd=0,
+            activestyle="none",
+            height=6,
+            highlightthickness=0,
+        )
+        self._ac_listbox.grid(row=0, column=0, sticky="ew")
+
+        ac_sb = tk.Scrollbar(self._ac_frame, orient="vertical",
+                             command=self._ac_listbox.yview)
+        ac_sb.grid(row=0, column=1, sticky="ns")
+        self._ac_listbox.configure(yscrollcommand=ac_sb.set)
+
+        # Bind events
+        self.v_company_search.trace_add("write", self._on_search_change)
+        self._ac_listbox.bind("<<ListboxSelect>>", self._on_ac_select)
+        self._company_search_entry.bind("<FocusOut>",
+            lambda e: self.after(150, self._hide_ac))
+        self._company_search_entry.bind("<Escape>",
+            lambda e: self._hide_ac())
+
+        # Selected tags area
+        tk.Label(
+            self._company_sel_frame,
+            text="Selected:",
+            font=("Consolas", 7), fg=C["faint"], bg=C["panel"],
+        ).grid(row=2, column=0, padx=20, pady=(8, 2), sticky="w")
+
+        self._tags_outer = tk.Frame(
+            self._company_sel_frame,
+            bg=C["hi"],
+            highlightthickness=1,
+            highlightbackground=C["border"],
+        )
+        self._tags_outer.grid(row=3, column=0, padx=20, pady=(0, 4), sticky="ew")
+
+        self._tags_canvas = tk.Canvas(
+            self._tags_outer, bg=C["hi"],
+            highlightthickness=0, height=72,
+        )
+        self._tags_canvas.pack(side="left", fill="both", expand=True)
+
+        tags_vsb = tk.Scrollbar(self._tags_outer, orient="vertical",
+                                command=self._tags_canvas.yview)
+        tags_vsb.pack(side="right", fill="y")
+        self._tags_canvas.configure(yscrollcommand=tags_vsb.set)
+
+        self._tags_inner = tk.Frame(self._tags_canvas, bg=C["hi"])
+        self._tags_canvas_win = self._tags_canvas.create_window(
+            (0, 0), window=self._tags_inner, anchor="nw"
+        )
+        self._tags_inner.bind(
+            "<Configure>",
+            lambda e: self._tags_canvas.configure(
+                scrollregion=self._tags_canvas.bbox("all")
+            )
+        )
+        self._tags_canvas.bind(
+            "<Configure>",
+            lambda e: self._tags_canvas.itemconfig(
+                self._tags_canvas_win, width=e.width
+            )
+        )
+
+        self._sel_count_lbl = tk.Label(
+            self._company_sel_frame,
+            text="0 selected",
+            font=("Consolas", 7), fg=C["faint"], bg=C["panel"],
+        )
+        self._sel_count_lbl.grid(row=4, column=0, padx=20, pady=(0, 2), sticky="w")
+
+        # Initially hide the picker (All is checked by default)
+        self._company_sel_frame.grid_remove()
+
+        _gap(left, r, 6); r += 1
 
         # ── Fetch Mode ────────────────────────────────────────
         _lbl(left, "FETCH MODE", r); r += 1
@@ -669,9 +827,10 @@ class App(tk.Tk):
         # Push buttons to bottom
         left.rowconfigure(r, weight=1); r += 1
 
+        # Row 1: START + STOP
         btn_frame = tk.Frame(left, bg=C["panel"])
         btn_frame.grid(row=r, column=0, columnspan=2,
-                       padx=20, pady=16, sticky="ew"); r += 1
+                       padx=20, pady=(16, 4), sticky="ew"); r += 1
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
 
@@ -692,6 +851,17 @@ class App(tk.Tk):
             cursor="hand2", state="disabled", command=self._do_stop,
         )
         self._stop_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        # Row 2: MAX HISTORY (full width, distinct amber colour)
+        self._maxhist_btn = tk.Button(
+            left, text="MAX HISTORY",
+            font=F_BTN, fg=C["bg"], bg=C["gold"],
+            activebackground="#FCD34D", activeforeground=C["bg"],
+            relief="flat", bd=0, pady=9,
+            cursor="hand2", command=self._ask_max_history,
+        )
+        self._maxhist_btn.grid(row=r, column=0, columnspan=2,
+                               padx=20, pady=(0, 16), sticky="ew"); r += 1
 
     # ---- RIGHT PANEL ----
 
@@ -749,6 +919,110 @@ class App(tk.Tk):
         self._tick()
 
     # -------------------------------------------------------------------------
+    # COMPANY SELECTION HELPERS
+    # -------------------------------------------------------------------------
+
+    def _on_all_companies_toggle(self, *_):
+        if self.v_all_companies.get():
+            self._company_sel_frame.grid_remove()
+        else:
+            self._company_sel_frame.grid()
+
+    def _on_search_change(self, *_):
+        query = self.v_company_search.get().strip().lower()
+        self._ac_listbox.delete(0, "end")
+
+        if not query or not self._stocks:
+            self._hide_ac()
+            return
+
+        selected_names = {s["company"] for s in self._selected_companies}
+        matches = [
+            s for s in self._stocks
+            if query in s["company"].lower()
+            and s["company"] not in selected_names
+        ][:30]
+
+        if matches:
+            for s in matches:
+                exch = s.get("exchange", "")
+                self._ac_listbox.insert("end", f"  {s['company']}  [{exch}]")
+            self._ac_matches = matches
+            self._ac_frame.grid()
+        else:
+            self._hide_ac()
+
+    def _on_ac_select(self, *_):
+        sel = self._ac_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        stock = self._ac_matches[idx]
+        self._add_company_tag(stock)
+        self.v_company_search.set("")
+        self._hide_ac()
+        self._company_search_entry.focus()
+
+    def _hide_ac(self):
+        self._ac_frame.grid_remove()
+
+    def _add_company_tag(self, stock):
+        if any(s["ticker"] == stock["ticker"] for s in self._selected_companies):
+            return
+        self._selected_companies.append(stock)
+        self._rebuild_tags()
+
+    def _remove_company_tag(self, stock):
+        self._selected_companies = [
+            s for s in self._selected_companies if s["ticker"] != stock["ticker"]
+        ]
+        self._rebuild_tags()
+
+    def _rebuild_tags(self):
+        for w in self._tags_inner.winfo_children():
+            w.destroy()
+
+        row_f = None
+        col   = 0
+        max_cols = 2
+
+        for i, stock in enumerate(self._selected_companies):
+            if col == 0:
+                row_f = tk.Frame(self._tags_inner, bg=C["hi"])
+                row_f.pack(fill="x", padx=4, pady=2)
+
+            tag = tk.Frame(row_f, bg=C["a_dim"],
+                           highlightthickness=1,
+                           highlightbackground=C["accent"])
+            tag.pack(side="left", padx=(0, 4))
+
+            short = stock["company"][:22] + ("…" if len(stock["company"]) > 22 else "")
+            tk.Label(tag, text=short,
+                     font=("Calibri", 8), fg=C["text"],
+                     bg=C["a_dim"], padx=6, pady=3,
+                     ).pack(side="left")
+
+            _s = stock  # capture for lambda
+            tk.Button(tag, text="×",
+                      font=("Calibri", 9, "bold"),
+                      fg=C["err"], bg=C["a_dim"],
+                      activebackground=C["a_dim"],
+                      activeforeground=C["text"],
+                      relief="flat", bd=0, padx=4, pady=2,
+                      cursor="hand2",
+                      command=lambda s=_s: self._remove_company_tag(s),
+                      ).pack(side="left")
+
+            col += 1
+            if col >= max_cols:
+                col = 0
+
+        n = len(self._selected_companies)
+        self._sel_count_lbl.config(
+            text=f"{n} selected" if n else "0 selected  —  type a name above to add"
+        )
+
+    # -------------------------------------------------------------------------
     # MODE / ANALYSIS TOGGLE
     # -------------------------------------------------------------------------
 
@@ -772,28 +1046,28 @@ class App(tk.Tk):
             self._analysis_frame.grid_remove()
 
     # -------------------------------------------------------------------------
-    # FILE DIALOGS
+    # FILE DIALOGS & AUTO-LOAD
     # -------------------------------------------------------------------------
 
-    def _browse_csv(self):
-        path = filedialog.askopenfilename(
-            title="Select stocks CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
-            return
+    def _auto_load_stocks(self):
+        """Load INDIA_LIST.csv automatically on startup."""
         try:
-            stocks = load_stocks_from_csv(path)
+            stocks = load_stocks_from_csv(INDIA_LIST_PATH)
             self._stocks = stocks
-            self.v_stocks_path.set(path)
-            self.v_stocks_count.set(f"{len(stocks)} tickers loaded "
-                                    f"({sum(1 for s in stocks if s['exchange']=='NSE')} NSE  "
-                                    f"{sum(1 for s in stocks if s['exchange']=='BSE')} BSE)")
-            self._log_write(f"Loaded {len(stocks)} tickers from {os.path.basename(path)}", "gold")
+            nse_c = sum(1 for s in stocks if s["exchange"] == "NSE")
+            bse_c = sum(1 for s in stocks if s["exchange"] == "BSE")
+            self._stocks_lbl.config(
+                text=f"{len(stocks)} tickers  ({nse_c} NSE  {bse_c} BSE)"
+            )
+            self._log_write(
+                f"Auto-loaded {len(stocks)} tickers from {INDIA_LIST_PATH}", "gold"
+            )
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self._stocks_lbl.config(text=f"Could not load: {e}", fg=C["err"])
+            self._log_write(f"Could not load {INDIA_LIST_PATH}: {e}", "err")
 
     def _browse_out(self):
+        from tkinter import filedialog
         path = filedialog.askdirectory(title="Choose output folder")
         if path:
             self.v_output.set(path)
@@ -804,6 +1078,156 @@ class App(tk.Tk):
         self._log.config(state="disabled")
 
     # -------------------------------------------------------------------------
+    # MAX HISTORY DIALOG
+    # -------------------------------------------------------------------------
+
+    def _ask_max_history(self):
+        """Pop up a small dialog asking how many years back, then launch."""
+        if not self._stocks:
+            messagebox.showerror("No stocks", f"Could not read {INDIA_LIST_PATH}.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Max History")
+        dlg.configure(bg=C["panel"])
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        # Centre over main window
+        self.update_idletasks()
+        px = self.winfo_x() + self.winfo_width()  // 2
+        py = self.winfo_y() + self.winfo_height() // 2
+        dlg.geometry(f"360x220+{px-180}+{py-110}")
+
+        tk.Label(dlg, text="MAX HISTORY FETCH",
+                 font=("Consolas", 11, "bold"),
+                 fg=C["gold"], bg=C["panel"],
+                 ).pack(pady=(20, 4))
+
+        tk.Label(dlg,
+                 text="Fetches the maximum available historical data\nfor every stock in INDIA_LIST.csv.",
+                 font=("Calibri", 9), fg=C["dim"], bg=C["panel"],
+                 justify="center",
+                 ).pack(pady=(0, 14))
+
+        # Years input row
+        row_f = tk.Frame(dlg, bg=C["panel"])
+        row_f.pack(pady=(0, 6))
+
+        tk.Label(row_f, text="Look back (years):",
+                 font=("Calibri", 10), fg=C["text"], bg=C["panel"],
+                 ).pack(side="left", padx=(0, 10))
+
+        v_yrs = tk.StringVar(value="max")
+        yrs_entry = tk.Entry(
+            row_f, textvariable=v_yrs, width=8,
+            font=("Calibri", 10),
+            bg=C["surface"], fg=C["text"],
+            insertbackground=C["text"],
+            relief="flat", bd=0,
+            highlightthickness=1,
+            highlightbackground=C["border"],
+            highlightcolor=C["gold"],
+        )
+        yrs_entry.pack(side="left", ipady=5)
+
+        tk.Label(dlg,
+                 text='Type a number or leave "max" for all available data.',
+                 font=("Calibri", 8), fg=C["faint"], bg=C["panel"],
+                 ).pack()
+
+        def _launch():
+            raw = v_yrs.get().strip().lower()
+            if raw == "max" or raw == "":
+                past_years = None   # will use period="max"
+            else:
+                try:
+                    past_years = int(raw)
+                    if past_years < 1:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid", "Enter a whole number or 'max'.",
+                                         parent=dlg)
+                    return
+            dlg.destroy()
+            self._launch_max_history(past_years)
+
+        tk.Button(
+            dlg, text="FETCH",
+            font=F_BTN, fg=C["bg"], bg=C["gold"],
+            activebackground="#FCD34D", activeforeground=C["bg"],
+            relief="flat", bd=0, padx=24, pady=8,
+            cursor="hand2", command=_launch,
+        ).pack(pady=(10, 0))
+
+    def _launch_max_history(self, past_years):
+        """Start Max History run. past_years=None means period='max'."""
+        output = self.v_output.get().strip()
+        os.makedirs(output, exist_ok=True)
+
+        if past_years is None:
+            cfg = {
+                "mode": "Period (yfinance)",
+                "period": "max",
+                "interval": "1d",
+                "enrich": False,
+                "separate": False,
+                "filename": "max_history",
+                "output": output,
+                "analysis": False,
+                "max_history": True,
+            }
+            label = "ALL AVAILABLE"
+        else:
+            cfg = {
+                "mode": "Past Years",
+                "past_years": past_years,
+                "interval": "1d",
+                "enrich": False,
+                "separate": False,
+                "filename": f"max_history_{past_years}yr",
+                "output": output,
+                "analysis": False,
+                "max_history": True,
+            }
+            label = f"{past_years} YEARS"
+
+        # Use the both-ticker stock list for fallback logic
+        try:
+            all_stocks = load_stocks_both_tickers(INDIA_LIST_PATH)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        total = len(all_stocks)
+        self._stop.clear()
+        self._stats      = {"done": 0, "total": total, "records": 0}
+        self._start_time = datetime.now()
+
+        self._pbar["maximum"] = total
+        self._pbar["value"]   = 0
+        self._s_stocks.config(text=f"0 / {total}")
+        self._s_records.config(text="0")
+        self._s_cur.config(text="—")
+        self._status_lbl.config(text="  RUNNING  ", fg=C["ok"])
+
+        self._start_btn.config(state="disabled")
+        self._maxhist_btn.config(state="disabled")
+        self._stop_btn.config(state="normal")
+
+        self._log_write("=" * 54, "head")
+        self._log_write(f"  MAX HISTORY  —  {label}  —  {total} tickers", "head")
+        self._log_write(f"  Output : {output}", "dim")
+        self._log_write(f"  NSE preferred, BSE fallback per ticker", "dim")
+        self._log_write("=" * 54, "head")
+
+        threading.Thread(
+            target=self._run_max_history,
+            args=(all_stocks, cfg),
+            daemon=True,
+        ).start()
+
+    # -------------------------------------------------------------------------
     # VALIDATION
     # -------------------------------------------------------------------------
 
@@ -811,6 +1235,18 @@ class App(tk.Tk):
         if not self._stocks:
             messagebox.showerror("No stocks", "Load a stocks CSV first.")
             return None
+
+        # Determine which stocks to fetch
+        if self.v_all_companies.get():
+            active_stocks = self._stocks
+        else:
+            active_stocks = self._selected_companies
+            if not active_stocks:
+                messagebox.showerror(
+                    "No companies selected",
+                    "Select at least one company, or tick 'Fetch for ALL companies'."
+                )
+                return None
 
         mode = self.v_mode.get()
         cfg  = {
@@ -820,6 +1256,7 @@ class App(tk.Tk):
             "separate": self.v_separate.get(),
             "filename": self.v_filename.get().strip() or "ohlc_output",
             "output":   self.v_output.get().strip(),
+            "stocks":   active_stocks,
         }
 
         if mode == "Date Range":
@@ -872,7 +1309,7 @@ class App(tk.Tk):
         os.makedirs(cfg["output"], exist_ok=True)
 
         self._stop.clear()
-        total = len(self._stocks)
+        total = len(cfg["stocks"])
         self._stats      = {"done": 0, "total": total, "records": 0}
         self._start_time = datetime.now()
 
@@ -884,6 +1321,7 @@ class App(tk.Tk):
         self._status_lbl.config(text="  RUNNING  ", fg=C["ok"])
 
         self._start_btn.config(state="disabled")
+        self._maxhist_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
 
         self._log_write("=" * 54, "head")
@@ -895,7 +1333,7 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._run,
-            args=(list(self._stocks), cfg),
+            args=(list(cfg["stocks"]), cfg),
             daemon=True,
         ).start()
 
@@ -962,6 +1400,100 @@ class App(tk.Tk):
             self._qlog(
                 f"\nFinished.  {self._stats['done']}/{self._stats['total']} tickers  |  "
                 f"{self._stats['records']} rows saved.", "head"
+            )
+            self._q.put(("done",))
+
+    def _run_max_history(self, all_stocks, cfg):
+        """
+        Max History thread: for each stock, try NSE first, fall back to BSE.
+        Both empty -> skipped, shown in log.
+        Saves one combined CSV at the end.
+        """
+        all_rows = []
+        skipped  = []
+
+        try:
+            for i, stock in enumerate(all_stocks):
+                if self._stop.is_set():
+                    self._qlog("Stopped by user.", "warn")
+                    break
+
+                company   = stock["company"]
+                nse_t     = stock["nse_ticker"]
+                bse_t     = stock["bse_ticker"]
+
+                self._q.put(("cur", company[:18]))
+                self._qlog(
+                    f"  [{i+1}/{len(all_stocks)}]  {company[:44]}", "info"
+                )
+
+                rows = []
+                used = None
+
+                # Try NSE first
+                if nse_t:
+                    self._qlog(f"    Trying NSE: {nse_t}", "dim")
+                    data = fetch_history(nse_t, cfg, self._qlog)
+                    if data is not None and not data.empty:
+                        data["Company"]  = company
+                        data["Ticker"]   = nse_t
+                        data["Exchange"] = "NSE"
+                        data["Year"]     = pd.to_datetime(data["Date"]).dt.year
+                        data["Date"]     = pd.to_datetime(data["Date"]).dt.date
+                        data[["Open","High","Low","Close"]] = data[["Open","High","Low","Close"]].round(2)
+                        rows = data.reindex(columns=OUTPUT_COLS).to_dict("records")
+                        used = nse_t
+
+                # Fall back to BSE if NSE gave nothing
+                if not rows and bse_t:
+                    self._qlog(f"    NSE empty — trying BSE: {bse_t}", "warn")
+                    data = fetch_history(bse_t, cfg, self._qlog)
+                    if data is not None and not data.empty:
+                        data["Company"]  = company
+                        data["Ticker"]   = bse_t
+                        data["Exchange"] = "BSE"
+                        data["Year"]     = pd.to_datetime(data["Date"]).dt.year
+                        data["Date"]     = pd.to_datetime(data["Date"]).dt.date
+                        data[["Open","High","Low","Close"]] = data[["Open","High","Low","Close"]].round(2)
+                        rows = data.reindex(columns=OUTPUT_COLS).to_dict("records")
+                        used = bse_t
+
+                if rows:
+                    all_rows.extend(rows)
+                    self._stats["records"] += len(rows)
+                    self._qlog(
+                        f"    OK  {len(rows)} rows  via {used}", "ok"
+                    )
+                else:
+                    skipped.append(company)
+                    self._qlog(
+                        f"    SKIPPED — no data on NSE or BSE", "err"
+                    )
+
+                self._stats["done"] = i + 1
+                self._q.put(("prog", i + 1, len(all_stocks)))
+                time.sleep(0.25)
+
+            # ── Save combined CSV ──────────────────────────────
+            if all_rows:
+                self._save(all_rows, cfg)
+            else:
+                self._qlog("No data fetched. Nothing saved.", "warn")
+
+            # ── Skipped summary ────────────────────────────────
+            if skipped:
+                self._qlog(f"\n  Skipped ({len(skipped)} stocks — no data found):", "warn")
+                for s in skipped:
+                    self._qlog(f"    {s}", "dim")
+
+        except Exception as e:
+            self._qlog(f"Unexpected error: {e}", "err")
+        finally:
+            self._qlog(
+                f"\nMax History complete.  "
+                f"{self._stats['done']}/{self._stats['total']} tickers  |  "
+                f"{self._stats['records']} rows  |  "
+                f"{len(skipped)} skipped.", "head"
             )
             self._q.put(("done",))
 
@@ -1047,6 +1579,7 @@ class App(tk.Tk):
                     self._s_cur.config(text=item[1])
                 elif kind == "done":
                     self._start_btn.config(state="normal")
+                    self._maxhist_btn.config(state="normal")
                     self._stop_btn.config(state="disabled")
                     self._status_lbl.config(text="  IDLE  ", fg=C["dim"])
                     self._start_time = None
