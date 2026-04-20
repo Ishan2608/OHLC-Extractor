@@ -12,9 +12,11 @@ Requirements:
 """
 
 import csv
+import json
 import os
 import re
 import queue
+import shutil
 import threading
 import time
 from datetime import datetime, date
@@ -110,6 +112,7 @@ def load_stocks_from_csv(path):
 
 
 INDIA_LIST_PATH = os.path.join("data", "INDIA_LIST.csv")
+CHECKPOINT_DIR  = ".ohlc_checkpoint"   # hidden folder inside output dir
 
 
 def load_stocks_both_tickers(path):
@@ -1164,22 +1167,228 @@ class App(tk.Tk):
         self._log.config(state="disabled")
 
     # -------------------------------------------------------------------------
-    # MAX HISTORY DIALOG
+    # MAX HISTORY DIALOG  +  CHECKPOINT / RESUME
     # -------------------------------------------------------------------------
 
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    def _ckpt_dir(self, output):
+        return os.path.join(output, CHECKPOINT_DIR)
+
+    def _save_checkpoint(self, closes_acc, volume_acc, all_rows,
+                         done_tickers, skipped, cfg):
+        """
+        Persist progress to disk so the run can be resumed later.
+
+        Layout inside  {output}/.ohlc_checkpoint/ :
+          meta.json           — config, done ticker list, stats
+          closes.csv          — partial closes pivot  (pivot mode only)
+          volume.csv          — partial volume pivot  (pivot mode only)
+          longformat.csv      — partial long-format rows (non-pivot mode only)
+        """
+        ckpt = self._ckpt_dir(cfg["output"])
+        os.makedirs(ckpt, exist_ok=True)
+
+        use_pivot = cfg.get("closes_pivot", False)
+
+        # Serialise cfg: drop un-JSON-able objects (datetime, stock list)
+        safe_cfg = {}
+        for k, v in cfg.items():
+            if k == "stocks":
+                continue
+            elif isinstance(v, datetime):
+                safe_cfg[k] = v.isoformat()
+            else:
+                safe_cfg[k] = v
+
+        meta = {
+            "timestamp":    datetime.now().isoformat(),
+            "done_tickers": done_tickers,
+            "skipped":      skipped,
+            "stats":        dict(self._stats),
+            "cfg":          safe_cfg,
+            "use_pivot":    use_pivot,
+        }
+        with open(os.path.join(ckpt, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        if use_pivot and closes_acc:
+            pd.DataFrame(closes_acc).sort_index().to_csv(
+                os.path.join(ckpt, "closes.csv")
+            )
+        if use_pivot and volume_acc:
+            pd.DataFrame(volume_acc).sort_index().to_csv(
+                os.path.join(ckpt, "volume.csv")
+            )
+        if not use_pivot and all_rows:
+            pd.DataFrame(all_rows).to_csv(
+                os.path.join(ckpt, "longformat.csv"), index=False
+            )
+
+        self._qlog(
+            f"  Checkpoint saved → {ckpt}", "warn"
+        )
+
+    def _load_checkpoint_meta(self, output):
+        """Return meta dict if a valid checkpoint exists, else None."""
+        path = os.path.join(self._ckpt_dir(output), "meta.json")
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _load_checkpoint_data(self, output):
+        """
+        Reload per-ticker Series dicts (pivot mode) or row list (long mode)
+        from the checkpoint CSVs.  Returns (closes_acc, volume_acc, all_rows).
+        """
+        ckpt       = self._ckpt_dir(output)
+        closes_acc = {}
+        volume_acc = {}
+        all_rows   = []
+
+        closes_path = os.path.join(ckpt, "closes.csv")
+        volume_path = os.path.join(ckpt, "volume.csv")
+        long_path   = os.path.join(ckpt, "longformat.csv")
+
+        if os.path.exists(closes_path):
+            df = pd.read_csv(closes_path, index_col=0, parse_dates=True)
+            for col in df.columns:
+                s = df[col].dropna()
+                s.index = pd.to_datetime(s.index).date
+                closes_acc[col] = s.rename(col)
+
+        if os.path.exists(volume_path):
+            df = pd.read_csv(volume_path, index_col=0, parse_dates=True)
+            for col in df.columns:
+                s = df[col].dropna()
+                s.index = pd.to_datetime(s.index).date
+                volume_acc[col] = s.rename(col)
+
+        if os.path.exists(long_path):
+            all_rows = pd.read_csv(long_path).to_dict("records")
+
+        return closes_acc, volume_acc, all_rows
+
+    def _clear_checkpoint(self, output):
+        """Delete the checkpoint directory after a successful full run."""
+        ckpt = self._ckpt_dir(output)
+        if os.path.exists(ckpt):
+            shutil.rmtree(ckpt, ignore_errors=True)
+            self._qlog("  Checkpoint cleared (run complete).", "dim")
+
+    # ── Dialogs ───────────────────────────────────────────────────────────────
+
     def _ask_max_history(self):
-        """Pop up a small dialog asking how many years back, then launch."""
+        """
+        Entry point for the MAX HISTORY button.
+        Checks for an existing checkpoint first; shows a resume dialog if found,
+        otherwise shows the normal fetch-settings dialog.
+        """
         if not self._stocks:
             messagebox.showerror("No stocks", f"Could not read {INDIA_LIST_PATH}.")
             return
 
+        output = self.v_output.get().strip()
+        meta   = self._load_checkpoint_meta(output)
+
+        if meta:
+            self._ask_resume(meta, output)
+        else:
+            self._show_max_history_dialog()
+
+    def _ask_resume(self, meta, output):
+        """
+        Show a dialog when a checkpoint is found.
+        Lets the user resume, start fresh, or cancel.
+        """
+        done      = len(meta.get("done_tickers", []))
+        total     = meta.get("stats", {}).get("total", "?")
+        records   = meta.get("stats", {}).get("records", 0)
+        skipped_n = len(meta.get("skipped", []))
+        ts        = meta.get("timestamp", "")[:19].replace("T", " ")
+        pivot     = meta.get("use_pivot", False)
+        fmt       = "Pivot / time-series" if pivot else "Long format"
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Resume previous run?")
+        dlg.configure(bg=C["panel"])
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        self.update_idletasks()
+        px = self.winfo_x() + self.winfo_width()  // 2
+        py = self.winfo_y() + self.winfo_height() // 2
+        dlg.geometry(f"440x310+{px-220}+{py-155}")
+
+        tk.Label(dlg, text="CHECKPOINT FOUND",
+                 font=("Consolas", 12, "bold"),
+                 fg=C["warn"], bg=C["panel"],
+                 ).pack(pady=(22, 6))
+
+        info = (
+            f"Saved:       {ts}\n"
+            f"Progress:    {done} / {total} tickers done\n"
+            f"Skipped:     {skipped_n}  (no data)\n"
+            f"Rows so far: {records:,}\n"
+            f"Format:      {fmt}"
+        )
+        tk.Label(dlg, text=info,
+                 font=("Consolas", 9), fg=C["text"], bg=C["panel"],
+                 justify="left",
+                 ).pack(padx=30, pady=(0, 18), anchor="w")
+
+        tk.Label(dlg,
+                 text="Resume picks up exactly where it stopped.\n"
+                      "Start Fresh discards saved progress permanently.",
+                 font=("Calibri", 8), fg=C["faint"], bg=C["panel"],
+                 justify="center",
+                 ).pack(pady=(0, 14))
+
+        btn_f = tk.Frame(dlg, bg=C["panel"])
+        btn_f.pack()
+
+        def _do_resume():
+            dlg.destroy()
+            self._launch_resume(meta, output)
+
+        def _do_fresh():
+            shutil.rmtree(self._ckpt_dir(output), ignore_errors=True)
+            dlg.destroy()
+            self._show_max_history_dialog()
+
+        tk.Button(btn_f, text="RESUME",
+                  font=F_BTN, fg=C["bg"], bg=C["ok"],
+                  activebackground="#6EE7B7", activeforeground=C["bg"],
+                  relief="flat", bd=0, padx=22, pady=9,
+                  cursor="hand2", command=_do_resume,
+                  ).pack(side="left", padx=4)
+
+        tk.Button(btn_f, text="START FRESH",
+                  font=F_BTN, fg=C["bg"], bg=C["warn"],
+                  activebackground="#FCD34D", activeforeground=C["bg"],
+                  relief="flat", bd=0, padx=22, pady=9,
+                  cursor="hand2", command=_do_fresh,
+                  ).pack(side="left", padx=4)
+
+        tk.Button(btn_f, text="CANCEL",
+                  font=F_BTN, fg=C["dim"], bg=C["surface"],
+                  activebackground=C["hi"], activeforeground=C["text"],
+                  relief="flat", bd=0, padx=22, pady=9,
+                  cursor="hand2", command=dlg.destroy,
+                  ).pack(side="left", padx=4)
+
+    def _show_max_history_dialog(self):
+        """Normal MAX HISTORY settings dialog (years / max)."""
         dlg = tk.Toplevel(self)
         dlg.title("Max History")
         dlg.configure(bg=C["panel"])
         dlg.resizable(False, False)
         dlg.grab_set()
 
-        # Centre over main window
         self.update_idletasks()
         px = self.winfo_x() + self.winfo_width()  // 2
         py = self.winfo_y() + self.winfo_height() // 2
@@ -1196,7 +1405,6 @@ class App(tk.Tk):
                  justify="center",
                  ).pack(pady=(0, 14))
 
-        # Years input row
         row_f = tk.Frame(dlg, bg=C["panel"])
         row_f.pack(pady=(0, 6))
 
@@ -1205,7 +1413,7 @@ class App(tk.Tk):
                  ).pack(side="left", padx=(0, 10))
 
         v_yrs = tk.StringVar(value="max")
-        yrs_entry = tk.Entry(
+        tk.Entry(
             row_f, textvariable=v_yrs, width=8,
             font=("Calibri", 10),
             bg=C["surface"], fg=C["text"],
@@ -1214,8 +1422,7 @@ class App(tk.Tk):
             highlightthickness=1,
             highlightbackground=C["border"],
             highlightcolor=C["gold"],
-        )
-        yrs_entry.pack(side="left", ipady=5)
+        ).pack(side="left", ipady=5)
 
         tk.Label(dlg,
                  text='Type a number or leave "max" for all available data.',
@@ -1224,8 +1431,8 @@ class App(tk.Tk):
 
         def _launch():
             raw = v_yrs.get().strip().lower()
-            if raw == "max" or raw == "":
-                past_years = None   # will use period="max"
+            if raw in ("max", ""):
+                past_years = None
             else:
                 try:
                     past_years = int(raw)
@@ -1246,58 +1453,134 @@ class App(tk.Tk):
             cursor="hand2", command=_launch,
         ).pack(pady=(10, 0))
 
+    # ── Launchers ─────────────────────────────────────────────────────────────
+
     def _launch_max_history(self, past_years):
-        """Start Max History run. past_years=None means period='max'."""
+        """Start a fresh Max History run. past_years=None → period='max'."""
         output = self.v_output.get().strip()
         os.makedirs(output, exist_ok=True)
 
         if past_years is None:
             cfg = {
-                "mode": "Period (yfinance)",
-                "period": "max",
-                "interval": "1d",
-                "enrich": False,
-                "separate": False,
+                "mode":           "Period (yfinance)",
+                "period":         "max",
+                "interval":       "1d",
+                "enrich":         False,
+                "separate":       False,
                 "closes_pivot":   self.v_closes_pivot.get(),
                 "pivot_vol_mode": self.v_pivot_vol_mode.get(),
-                "filename": "max_history",
-                "output": output,
-                "analysis": False,
-                "max_history": True,
+                "filename":       "max_history",
+                "output":         output,
+                "analysis":       False,
+                "max_history":    True,
             }
             label = "ALL AVAILABLE"
         else:
             cfg = {
-                "mode": "Past Years",
-                "past_years": past_years,
-                "interval": "1d",
-                "enrich": False,
-                "separate": False,
+                "mode":           "Past Years",
+                "past_years":     past_years,
+                "interval":       "1d",
+                "enrich":         False,
+                "separate":       False,
                 "closes_pivot":   self.v_closes_pivot.get(),
                 "pivot_vol_mode": self.v_pivot_vol_mode.get(),
-                "filename": f"max_history_{past_years}yr",
-                "output": output,
-                "analysis": False,
-                "max_history": True,
+                "filename":       f"max_history_{past_years}yr",
+                "output":         output,
+                "analysis":       False,
+                "max_history":    True,
             }
             label = f"{past_years} YEARS"
 
-        # Use the both-ticker stock list for fallback logic
         try:
             all_stocks = load_stocks_both_tickers(INDIA_LIST_PATH)
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
 
+        self._start_max_history_thread(all_stocks, cfg, label,
+                                       resume_closes={},
+                                       resume_volume={},
+                                       resume_rows=[],
+                                       resume_done=[])
+
+    def _launch_resume(self, meta, output):
+        """Resume a stopped Max History run from checkpoint data."""
+        self._log_write("=" * 54, "head")
+        self._log_write("  RESUMING FROM CHECKPOINT", "warn")
+        self._log_write(f"  Loading saved data...", "dim")
+
+        try:
+            closes_acc, volume_acc, all_rows = self._load_checkpoint_data(output)
+        except Exception as e:
+            self._log_write(f"  Could not load checkpoint data: {e}", "err")
+            messagebox.showerror("Resume failed",
+                                 f"Could not read checkpoint files:\n{e}")
+            return
+
+        done_tickers = set(meta.get("done_tickers", []))
+        saved_cfg    = meta.get("cfg", {})
+
+        # Re-hydrate cfg from saved metadata
+        cfg = {
+            "mode":           saved_cfg.get("mode", "Period (yfinance)"),
+            "period":         saved_cfg.get("period", "max"),
+            "interval":       saved_cfg.get("interval", "1d"),
+            "enrich":         saved_cfg.get("enrich", False),
+            "separate":       saved_cfg.get("separate", False),
+            "closes_pivot":   saved_cfg.get("closes_pivot", False),
+            "pivot_vol_mode": saved_cfg.get("pivot_vol_mode", "none"),
+            "filename":       saved_cfg.get("filename", "max_history"),
+            "output":         output,
+            "analysis":       False,
+            "max_history":    True,
+        }
+        if "past_years" in saved_cfg:
+            cfg["past_years"] = saved_cfg["past_years"]
+
+        # Load full stock list and remove already-done tickers
+        try:
+            all_stocks = load_stocks_both_tickers(INDIA_LIST_PATH)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        remaining = [
+            s for s in all_stocks
+            if s.get("nse_ticker") not in done_tickers
+            and s.get("bse_ticker") not in done_tickers
+        ]
+
+        n_done = len(all_stocks) - len(remaining)
+        label  = f"RESUME  ({n_done} already done, {len(remaining)} remaining)"
+
+        self._log_write(
+            f"  Loaded {len(closes_acc)} tickers from checkpoint  |  "
+            f"{len(remaining)} remaining", "ok"
+        )
+
+        self._start_max_history_thread(remaining, cfg, label,
+                                       resume_closes=closes_acc,
+                                       resume_volume=volume_acc,
+                                       resume_rows=all_rows,
+                                       resume_done=list(done_tickers))
+
+    def _start_max_history_thread(self, all_stocks, cfg, label,
+                                  resume_closes, resume_volume,
+                                  resume_rows, resume_done):
+        """Wire up the UI and spin up the background thread."""
         total = len(all_stocks)
         self._stop.clear()
-        self._stats      = {"done": 0, "total": total, "records": 0}
+        self._stats      = {
+            "done":    0,
+            "total":   total,
+            "records": self._stats.get("records", 0),   # carry over on resume
+        }
         self._start_time = datetime.now()
 
-        self._pbar["maximum"] = total
+        self._pbar["maximum"] = max(total, 1)
         self._pbar["value"]   = 0
         self._s_stocks.config(text=f"0 / {total}")
-        self._s_records.config(text="0")
+        self._s_records.config(text=str(self._stats["records"]))
         self._s_cur.config(text="—")
         self._status_lbl.config(text="  RUNNING  ", fg=C["ok"])
 
@@ -1307,13 +1590,15 @@ class App(tk.Tk):
 
         self._log_write("=" * 54, "head")
         self._log_write(f"  MAX HISTORY  —  {label}  —  {total} tickers", "head")
-        self._log_write(f"  Output : {output}", "dim")
+        self._log_write(f"  Output : {cfg['output']}", "dim")
         self._log_write(f"  NSE preferred, BSE fallback per ticker", "dim")
         self._log_write("=" * 54, "head")
 
         threading.Thread(
             target=self._run_max_history,
-            args=(all_stocks, cfg),
+            args=(all_stocks, cfg,
+                  resume_closes, resume_volume,
+                  resume_rows, resume_done),
             daemon=True,
         ).start()
 
@@ -1495,32 +1780,35 @@ class App(tk.Tk):
             )
             self._q.put(("done",))
 
-    def _run_max_history(self, all_stocks, cfg):
+    def _run_max_history(self, all_stocks, cfg,
+                         resume_closes=None, resume_volume=None,
+                         resume_rows=None,  resume_done=None):
         """
-        Max History thread: try NSE first per stock, fall back to BSE.
+        Max History thread.
 
-        Two accumulation strategies depending on whether pivot mode is on:
+        On a fresh run  resume_* args are empty.
+        On a resume run they carry the data loaded from the checkpoint,
+        and all_stocks has already had the done tickers filtered out.
 
-        PIVOT MODE  (closes_pivot=True)
-            Stores one pd.Series per ticker for Close and Volume directly —
-            never builds a list of row dicts.  Peak RAM ≈ 300–500 MB for the
-            full Indian market regardless of stock count.
+        Stop behaviour
+        ──────────────
+        When the user clicks STOP the loop exits cleanly.  Whatever has
+        been accumulated (including pre-loaded resume data) is written to
+        a checkpoint so the run can be continued next time.
 
-        LONG FORMAT  (closes_pivot=False)
-            Original behaviour: accumulates all_rows, then calls _save().
-            Suitable for smaller selections where the long CSV is the goal.
+        Completion behaviour
+        ────────────────────
+        On natural completion the final output is saved and the checkpoint
+        directory is deleted.
         """
         use_pivot = cfg.get("closes_pivot", False)
 
-        # ── Pivot-mode accumulators (lightweight) ──────────────────────────
-        # {ticker: pd.Series(values, index=datetime.date[])}
-        closes_acc = {}
-        volume_acc = {}
-
-        # ── Long-format accumulator (original path) ────────────────────────
-        all_rows = []
-
-        skipped = []
+        # Pre-populate accumulators with any resumed data
+        closes_acc   = dict(resume_closes or {})
+        volume_acc   = dict(resume_volume or {})
+        all_rows     = list(resume_rows   or [])
+        done_tickers = list(resume_done   or [])
+        skipped      = []
 
         try:
             for i, stock in enumerate(all_stocks):
@@ -1555,24 +1843,19 @@ class App(tk.Tk):
                         used = bse_t
 
                 if data is not None and not data.empty:
-                    # Common date parsing (shared by both paths)
                     dates = pd.to_datetime(data["Date"]).dt.date
 
                     if use_pivot:
-                        # ── Pivot path: store bare Series, no dict overhead ──
                         closes_acc[used] = pd.Series(
                             data["Close"].round(2).values,
-                            index=dates,
-                            name=used,
+                            index=dates, name=used,
                         )
                         volume_acc[used] = pd.Series(
                             data["Volume"].values,
-                            index=dates,
-                            name=used,
+                            index=dates, name=used,
                         )
                         n = len(dates)
                     else:
-                        # ── Long-format path: original row-dict accumulation ─
                         exch = "NSE" if used == nse_t else "BSE"
                         data["Company"]  = company
                         data["Ticker"]   = used
@@ -1586,6 +1869,7 @@ class App(tk.Tk):
                         all_rows.extend(rows)
                         n = len(rows)
 
+                    done_tickers.append(used)
                     self._stats["records"] += n
                     self._qlog(f"    OK  {n} rows  via {used}", "ok")
 
@@ -1597,17 +1881,27 @@ class App(tk.Tk):
                 self._q.put(("prog", i + 1, len(all_stocks)))
                 time.sleep(0.25)
 
-            # ── Save ───────────────────────────────────────────────────────
-            if use_pivot:
-                if closes_acc:
-                    self._save_pivot_from_acc(closes_acc, volume_acc, cfg)
-                else:
-                    self._qlog("No data fetched. Nothing saved.", "warn")
+            # ── Post-loop: save checkpoint or final output ─────────────────
+            if self._stop.is_set():
+                # Partial run — persist everything for later resume
+                self._qlog("\n  Saving checkpoint for resume...", "warn")
+                self._save_checkpoint(
+                    closes_acc, volume_acc, all_rows,
+                    done_tickers, skipped, cfg,
+                )
+                self._qlog(
+                    f"  {len(done_tickers)} tickers saved.  "
+                    "Click MAX HISTORY next time to resume.", "warn"
+                )
             else:
-                if all_rows:
+                # Full completion — write final output, wipe checkpoint
+                if use_pivot and closes_acc:
+                    self._save_pivot_from_acc(closes_acc, volume_acc, cfg)
+                elif not use_pivot and all_rows:
                     self._save(all_rows, cfg)
                 else:
                     self._qlog("No data fetched. Nothing saved.", "warn")
+                self._clear_checkpoint(cfg["output"])
 
             # ── Skipped summary ────────────────────────────────────────────
             if skipped:
