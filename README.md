@@ -134,7 +134,7 @@ Enable this with the **Save Closes-Only pivot** checkbox in the OUTPUT section. 
 Three sub-options control what is included:
 
 | Option | Output | Description |
-||||
+| --- | --- | --- |
 | Closes only | `{name}_closes_{ts}.csv` | One file. Close prices only. |
 | Closes + Volume — two separate CSVs | `{name}_closes_{ts}.csv` + `{name}_volume_{ts}.csv` | Two files with identical date indexes. Each cell is the close price or volume respectively. The two CSVs are guaranteed to align row-for-row. |
 | Closes + Volume — MultiIndex columns | `{name}_pivot_multi_{ts}.csv` | One file. Column header has two rows: the first row is the metric (`Close` or `Volume`), the second is the ticker. |
@@ -208,12 +208,11 @@ When a run finishes naturally (all stocks processed), the checkpoint directory i
 
 All files are saved to the **Output Folder** specified in the control panel (default: `ohlc_data/` inside the working directory). Filenames always include a timestamp suffix `YYYYMMDD_HHMMSS` so repeated runs never overwrite each other.
 
-| File | When created |
-|||
+| File | Description |
+| --- | --- |
 | `{name}_{ts}.csv` | Long format, combined |
 | `{name}_{company}_{ts}.csv` | Long format, separate per stock |
 | `{name}_closes_{ts}.csv` | Pivot — closes only, or closes half of "separate" mode |
 | `{name}_volume_{ts}.csv` | Pivot — volume half of "separate" mode |
 | `{name}_pivot_multi_{ts}.csv` | Pivot — MultiIndex (Close + Volume in one file) |
 | `{name}_analysis_{ts}.txt` | Interval analysis report |
-
