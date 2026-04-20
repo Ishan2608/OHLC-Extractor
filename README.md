@@ -51,7 +51,7 @@ The application loads the stock list automatically on startup. No manual import 
 The application reads `data/INDIA_LIST.csv` at launch. Expected columns:
 
 | Column | Description |
-|||
+| --- | --- |
 | `Company_Name` | Human-readable company name |
 | `NSE_Symbol` | NSE ticker symbol (e.g. `RELIANCE`) |
 | `BSE_Symbol` | BSE ticker symbol (e.g. `500325`) |
